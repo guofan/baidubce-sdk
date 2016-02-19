@@ -24,6 +24,7 @@ var qs = require('querystring');
 
 var u = require('underscore');
 var Q = require('q');
+var async = require('async');
 
 var H = require('./headers');
 var Auth = require('./auth');
@@ -32,11 +33,37 @@ var BceBaseClient = require('./bce_base_client');
 var MimeType = require('./mime.types');
 var WMStream = require('./wm_stream');
 
-// var MIN_PART_SIZE = 5242880;             // 5M
+var MIN_PART_SIZE = 5242880;                // 5M
+var THREAD = 2;
 var MAX_PUT_OBJECT_LENGTH = 5368709120;     // 5G
 var MAX_USER_METADATA_SIZE = 2048;          // 2 * 1024
 var MIN_PART_NUMBER = 1;
 var MAX_PART_NUMBER = 10000;
+var COMMAND_MAP = {
+    scale: 's',
+    width: 'w',
+    height: 'h',
+    quality: 'q',
+    format: 'f',
+    angle: 'a',
+    display: 'd',
+    limit: 'l',
+    crop: 'c',
+    offsetX: 'x',
+    offsetY: 'y',
+    watermark: 'wm',
+    key: 'k',
+    gravity: 'g',
+    gravityX: 'x',
+    gravityY: 'y',
+    opacity: 'o',
+    text: 't',
+    fontSize: 'sz',
+    fontFamily: 'ff',
+    fontColor: 'fc',
+    fontStyle: 'fs'
+};
+var IMAGE_DOMAIN = 'bceimg.com';
 
 /**
  * BOS service api
@@ -59,7 +86,7 @@ util.inherits(BosClient, BceBaseClient);
 
 // --- B E G I N ---
 BosClient.prototype.generatePresignedUrl = function (bucketName, key, timestamp,
-    expirationInSeconds, headers, params, headersToSign, config) {
+                                                     expirationInSeconds, headers, params, headersToSign, config) {
 
     config = u.extend({}, this.config, config);
     params = params || {};
@@ -82,6 +109,41 @@ BosClient.prototype.generatePresignedUrl = function (bucketName, key, timestamp,
     params.authorization = authorization;
 
     return util.format('%s%s?%s', config.endpoint, resource, qs.encode(params));
+};
+
+BosClient.prototype.generateUrl = function (bucketName, key, pipeline, cdn) {
+    var resource = path.normalize(path.join(
+        '/v1',
+        bucketName || '',
+        key || ''
+    )).replace(/\\/g, '/');
+    // pipeline表示如何对图片进行处理.
+    var command = '';
+    if (pipeline) {
+        if (u.isString(pipeline)) {
+            if (/^@/.test(pipeline)) {
+                command = pipeline;
+            }
+            else {
+                command = '@' + pipeline;
+            }
+        }
+        else {
+            command = '@' + u.map(pipeline, function (params) {
+                    return u.map(params, function (value, key) {
+                        return [COMMAND_MAP[key] || key, value].join('_');
+                    }).join(',');
+                }).join('|');
+        }
+    }
+    if (command) {
+        // 需要生成图片转码url
+        if (cdn) {
+            return util.format('http://%s/%s%s', cdn, path.normalize(key), command);
+        }
+        return util.format('http://%s.%s/%s%s', path.normalize(bucketName), IMAGE_DOMAIN, path.normalize(key), command);
+    }
+    return util.format('%s%s%s', this.config.endpoint, resource, command);
 };
 
 BosClient.prototype.listBuckets = function (options) {
@@ -234,8 +296,11 @@ BosClient.prototype.putObjectFromDataUrl = function (bucketName, key, data, opti
 };
 
 BosClient.prototype.putObjectFromString = function (bucketName, key, data, options) {
+    options = options || {};
+
     var headers = {};
     headers[H.CONTENT_LENGTH] = Buffer.byteLength(data);
+    headers[H.CONTENT_TYPE] = options[H.CONTENT_TYPE] || MimeType.guess(path.extname(key));
     headers[H.CONTENT_MD5] = require('./crypto').md5sum(data);
     options = u.extend(headers, options);
 
@@ -310,10 +375,18 @@ BosClient.prototype.getObjectToFile = function (bucketName, key, filename, range
 
 BosClient.prototype.copyObject = function (sourceBucketName, sourceKey, targetBucketName, targetKey, options) {
     /*eslint-disable*/
-    if (!sourceBucketName) { throw new TypeError('sourceBucketName should not be empty'); }
-    if (!sourceKey) { throw new TypeError('sourceKey should not be empty'); }
-    if (!targetBucketName) { throw new TypeError('targetBucketName should not be empty'); }
-    if (!targetKey) { throw new TypeError('targetKey should not be empty'); }
+    if (!sourceBucketName) {
+        throw new TypeError('sourceBucketName should not be empty');
+    }
+    if (!sourceKey) {
+        throw new TypeError('sourceKey should not be empty');
+    }
+    if (!targetBucketName) {
+        throw new TypeError('targetBucketName should not be empty');
+    }
+    if (!targetKey) {
+        throw new TypeError('targetKey should not be empty');
+    }
     /*eslint-enable*/
 
     options = this._checkOptions(options || {});
@@ -380,7 +453,7 @@ BosClient.prototype.completeMultipartUpload = function (bucketName, key, uploadI
 };
 
 BosClient.prototype.uploadPartFromFile = function (bucketName, key, uploadId, partNumber,
-    partSize, filename, offset, partMd5, options) {
+                                                   partSize, filename, offset, partMd5, options) {
 
     var start = offset;
     var end = offset + partSize - 1;
@@ -390,7 +463,7 @@ BosClient.prototype.uploadPartFromFile = function (bucketName, key, uploadId, pa
 };
 
 BosClient.prototype.uploadPartFromBlob = function (bucketName, key, uploadId, partNumber,
-    partSize, blob, options) {
+                                                   partSize, blob, options) {
     if (blob.size !== partSize) {
         throw new TypeError(util.format('Invalid partSize %d and data length %d',
             partSize, blob.size));
@@ -414,7 +487,7 @@ BosClient.prototype.uploadPartFromBlob = function (bucketName, key, uploadId, pa
 };
 
 BosClient.prototype.uploadPartFromDataUrl = function (bucketName, key, uploadId, partNumber,
-    partSize, dataUrl, options) {
+                                                      partSize, dataUrl, options) {
 
     var data = new Buffer(dataUrl, 'base64');
     if (data.length !== partSize) {
@@ -440,11 +513,15 @@ BosClient.prototype.uploadPartFromDataUrl = function (bucketName, key, uploadId,
 };
 
 BosClient.prototype.uploadPart = function (bucketName, key, uploadId, partNumber,
-    partSize, partFp, partMd5, options) {
+                                           partSize, partFp, partMd5, options) {
 
     /*eslint-disable*/
-    if (!bucketName) { throw new TypeError('bucketName should not be empty');}
-    if (!key) { throw new TypeError('key should not be empty'); }
+    if (!bucketName) {
+        throw new TypeError('bucketName should not be empty');
+    }
+    if (!key) {
+        throw new TypeError('key should not be empty');
+    }
     /*eslint-enable*/
     if (partNumber < MIN_PART_NUMBER || partNumber > MAX_PART_NUMBER) {
         throw new TypeError(util.format('Invalid partNumber %d. The valid range is from %d to %d.',
@@ -484,12 +561,15 @@ BosClient.prototype.uploadPart = function (bucketName, key, uploadId, partNumber
             config: options.config
         });
     }
+
     return newPromise();
 };
 
 BosClient.prototype.listParts = function (bucketName, key, uploadId, options) {
     /*eslint-disable*/
-    if (!uploadId) { throw new TypeError('uploadId should not empty'); }
+    if (!uploadId) {
+        throw new TypeError('uploadId should not empty');
+    }
     /*eslint-enable*/
 
     var allowedParams = ['maxParts', 'partNumberMarker', 'uploadId'];
@@ -541,9 +621,11 @@ BosClient.prototype.sendRequest = function (httpMethod, varArgs) {
     var client = this;
     var agent = this._httpAgent = new HttpClient(config);
     u.each(['progress', 'error', 'abort'], function (eventName) {
-        agent.on(eventName, function (evt) {
-            client.emit(eventName, evt);
-        });
+        agent.on(eventName, (function (params) {
+            return function (evt) {
+                client.emit(eventName, u.extend(evt, u.pick(params, 'partNumber', 'uploadId')));
+            }
+        })(args.params));
     });
     return this._httpAgent.sendRequest(httpMethod, resource, args.body,
         args.headers, args.params, u.bind(this.createSignature, this),
@@ -568,7 +650,8 @@ BosClient.prototype._prepareObjectHeaders = function (options) {
         H.CONTENT_MD5,
         H.CONTENT_TYPE,
         H.CONTENT_DISPOSITION,
-        H.ETAG
+        H.ETAG,
+        H.SEESION_TOKEN
     ];
     var metaSize = 0;
     var headers = u.pick(options, function (value, key) {
@@ -610,7 +693,88 @@ BosClient.prototype._prepareObjectHeaders = function (options) {
     return headers;
 };
 
-module.exports = BosClient;
+BosClient.prototype.uploadFecade = function (bucketName, key, blob, partSize, threadNum, options) {
+    partSize = partSize || MIN_PART_SIZE;
+    threadNum = threadNum || THREAD;
+    var size = blob.size;
+    if (size <= partSize) {
+        return this.putObjectFromBlob(bucketName, key, blob, options);
+    }
+    return (function (client, bucketName, key, blob, partSize, threadNum, options) {
+        var uploadId;
+        return client.initiateMultipartUpload(bucketName, key, options).then(function (res) {
+            uploadId = res.body.uploadId;
+            var deferred = Q.defer();
+            var tasks = getTasks(blob, uploadId, bucketName, key, partSize);
+            var state = {
+                lengthComputable: true,
+                loaded: 0,
+                total: tasks.length
+            };
 
+            async.mapLimit(tasks, threadNum, uploadPartFile(state, client), function (err, results) {
+                if (err) {
+                    deferred.reject(err);
+                }
+                else {
+                    deferred.resolve(results);
+                }
+            });
+            return deferred.promise;
+        }).then(function (allResponse) {
+            var partList = u.map(allResponse, function (response, index) {
+                // 生成分块清单
+                return {
+                    partNumber: index + 1,
+                    eTag: response.http_headers.etag
+                };
+            });
+            return client.completeMultipartUpload(bucketName, key, uploadId, partList); // 完成上传
+        });
+    })(this, bucketName, key, blob, partSize, threadNum, options);
+};
+
+function uploadPartFile(state, client) {
+    return function (task, callback) {
+        var blob = task.file.slice(task.start, task.stop + 1);
+        client.uploadPartFromBlob(task.bucketName, task.key, task.uploadId, task.partNumber, task.partSize, blob)
+            .then(function (res) {
+                ++state.loaded;
+                client.emit('progress', state);
+                callback(null, res);
+            })
+            .catch(function (err) {
+                callback(err);
+            });
+    };
+}
+function getTasks(file, uploadId, bucketName, key, PART_SIZE) {
+    var leftSize = file.size;
+    var offset = 0;
+    var partNumber = 1;
+
+    var tasks = [];
+
+    while (leftSize > 0) {
+        var partSize = Math.min(leftSize, PART_SIZE);
+        tasks.push({
+            file: file,
+            uploadId: uploadId,
+            bucketName: bucketName,
+            key: key,
+            partNumber: partNumber,
+            partSize: partSize,
+            start: offset,
+            stop: offset + partSize - 1
+        });
+
+        leftSize -= partSize;
+        offset += partSize;
+        partNumber += 1;
+    }
+    return tasks;
+}
+
+module.exports = BosClient;
 
 /* vim: set ts=4 sw=4 sts=4 tw=120: */
